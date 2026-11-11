@@ -1,0 +1,543 @@
+local PANDA_CONFIG = {
+    origin = "https://vault.pandauth.com",
+    publicId = "f9245a43ece1867c",
+    preset = "smokedglass",
+    displayName = "Vault",
+    description = "press get key paste the url copied into the browser follow steps to get the key and paste the key into loader and press contine",
+    logoUrl = nil,
+    supportUrl = "https://discord.gg/Ek4zecBNM3",
+    getKeyUrl = "https://ads.pandauth.com/getkey/vaulthub",
+    accent = Color3.fromRGB(139, 92, 246),
+    sessionSeconds = 600,
+    heartbeatSeconds = 30,
+    heartbeatRetries = 5,
+}
+--[[
+    The Panda-managed KVS runtime.
+
+    PANDA OWNS EVERYTHING IN THIS FILE. A developer supplies branding values,
+    which arrive in the PANDA table below already escaped, and nothing else. They
+    do not supply code, they do not supply the HTTP calls, and they do not supply
+    the decision about whether a key is good: that decision is made on a server
+    they do not control, and this file only shows the answer.
+
+    This is also NOT the security boundary. Everything here runs on a player's
+    machine and can be read, patched or replaced. It exists to make the flow work
+    and to make an attack inconvenient. What makes an attack fail is that the
+    server will not issue a delivery permit without a live nonce and a key it
+    just checked with PandaAuth.
+]]
+
+local PANDA = PANDA_CONFIG
+
+local HttpService = game:GetService("HttpService")
+local Players = game:GetService("Players")
+local TweenService = game:GetService("TweenService")
+
+-- Executors expose a POST-capable request under several names and none of them
+-- are guaranteed. Found once here so the rest of the file can assume it, and so
+-- a missing one becomes a readable message rather than a nil call later.
+local httpRequest =
+    (syn and syn.request)
+    or (http and http.request)
+    or request
+    or http_request
+    or (fluxus and fluxus.request)
+
+local function fail(message)
+    error("[Panda] " .. message, 0)
+end
+
+if not httpRequest then
+    fail("Your executor does not support HTTP POST, which this script requires.")
+end
+
+-- The wire protocol this runtime speaks. Revision 2 understands structured
+-- refusals: a JSON body whose "action" says continue, kick, stop or retry, and
+-- "retryAfter" says when. The server keeps answering a client that does not
+-- send this header exactly the way it always has.
+local PROTOCOL = "2"
+
+-- A delivery refusal the same permit may be fetched again after: storage was
+-- briefly unreachable, or the download is still in flight elsewhere. It is a
+-- Lua comment on the body's first line, the only channel a GET has.
+local RETRY_MARKER = "--[[panda:retry]]"
+
+local function nowMs()
+    local ok, value = pcall(function() return DateTime.now().UnixTimestampMillis end)
+    if ok and type(value) == "number" then
+        return value
+    end
+    return tick() * 1000
+end
+
+-- Returns the decoded body and the HTTP status. A transport failure, or a body
+-- that is not a JSON object, returns nil and a message: the caller treats that
+-- as "Panda could not be reached" and decides whether to try again.
+local function post(path, body)
+    local ok, response = pcall(httpRequest, {
+        Url = PANDA.origin .. path,
+        Method = "POST",
+        Headers = {
+            ["Content-Type"] = "application/json",
+            ["X-Panda-Kvs-Protocol"] = PROTOCOL,
+        },
+        Body = HttpService:JSONEncode(body),
+    })
+
+    if not ok or not response or not response.Body then
+        return nil, "Panda could not be reached. Check your internet connection."
+    end
+
+    local decoded
+    ok, decoded = pcall(function() return HttpService:JSONDecode(response.Body) end)
+
+    if not ok or type(decoded) ~= "table" then
+        return nil, "Panda returned an unexpected response."
+    end
+
+    return decoded, tonumber(response.StatusCode)
+end
+
+-- A wait of roughly `seconds`, spread by up to `spread` so that clients that
+-- started together (a server restart, a popular release) do not stay in step.
+local function jittered(seconds, spread)
+    return seconds + (math.random() * 2 - 1) * (spread or 0)
+end
+
+-- The device identifier. Executors disagree on the name, and one that offers
+-- none at all cannot be used with a HWID-locked key, which the server will say.
+local function hardwareId()
+    local getters = {
+        function() return game:GetService("RbxAnalyticsService"):GetClientId() end,
+        function() return gethwid() end,
+        function() return syn.crypt.hash(game:GetService("RbxAnalyticsService"):GetClientId()) end,
+    }
+
+    for _, getter in ipairs(getters) do
+        local ok, value = pcall(getter)
+        if ok and type(value) == "string" and #value > 0 then
+            return value
+        end
+    end
+
+    return ""
+end
+
+-- ── what the client can say about itself ─────────────────────────────────────
+--
+-- Three facts an owner sees in their Discord key log, when they turned one on.
+-- ALL THREE ARE CLAIMS. They are read on the player's machine, they travel with
+-- the key attempt, and the server treats them as text to print and never as an
+-- input to a decision. Nothing here can refuse or allow anyone.
+
+local function playerName()
+    local ok, name = pcall(function() return Players.LocalPlayer.Name end)
+
+    return (ok and type(name) == "string") and name or ""
+end
+
+-- identifyexecutor is the near-universal name; the others are what older or
+-- smaller executors shipped. A missing one is reported as unknown by the server.
+local function executorName()
+    local getters = { identifyexecutor, getexecutorname }
+
+    for _, getter in ipairs(getters) do
+        if type(getter) == "function" then
+            local ok, value = pcall(getter)
+            if ok and type(value) == "string" and #value > 0 then
+                return value
+            end
+        end
+    end
+
+    return ""
+end
+
+-- The place name costs a web call, so it is fetched once in the background while
+-- the player is still reading the prompt, and the place id stands in until it
+-- lands. A key attempt never waits for it.
+local placeName = ""
+
+task.spawn(function()
+    local ok, info = pcall(function()
+        return game:GetService("MarketplaceService"):GetProductInfo(game.PlaceId)
+    end)
+
+    if ok and type(info) == "table" and type(info.Name) == "string" then
+        placeName = info.Name
+    end
+end)
+
+local function gameName()
+    if placeName ~= "" then
+        return placeName
+    end
+
+    return "Place " .. tostring(game.PlaceId)
+end
+
+-- ── the interface ────────────────────────────────────────────────────────────
+--
+-- Every builder returns the same handle: { screen, field, submit, status }. The
+-- flow below drives those four and knows nothing about which layout produced
+-- them, so a new preset is a new builder plus a line in buildGui and nothing
+-- else. field is the key box, submit is the primary button the flow relabels
+-- while it checks, status is the line it writes the result to, screen is what it
+-- destroys when it is done.
+
+-- The service's get-key page carrying this machine's HWID, so the key the player
+-- earns is one this device can use. The support link stands in only when the
+-- script has no service to link to.
+local function keyLink()
+    if PANDA.getKeyUrl then
+        local hwid = hardwareId()
+        if hwid == "" then
+            return PANDA.getKeyUrl
+        end
+        -- Raw when already URL-safe, as the V2 loaders send it. UrlEncode would
+        -- turn every dash of a GUID into %2D.
+        if not hwid:match("^[%w%-%._~]+$") then
+            local ok, encoded = pcall(function() return HttpService:UrlEncode(hwid) end)
+            hwid = ok and encoded or hwid
+        end
+        return PANDA.getKeyUrl .. "?hwid=" .. hwid
+    end
+    return PANDA.supportUrl
+end
+
+-- Copies a link to the clipboard, or shows it when the executor has no clipboard.
+local function copyKeyLink(setStatus, accent, bad)
+    local link = keyLink()
+    if not link or link == "" then
+        setStatus("No key page is configured for this script.", bad)
+        return
+    end
+    local ok = pcall(function() setclipboard(link) end)
+    setStatus(ok and "Key link copied to your clipboard." or link, accent)
+end
+
+-- Connections made on a service or an engine-owned InputObject rather than on
+-- the GUI. Destroying the screen does not end them, so the flow disconnects them
+-- itself once the key prompt is gone.
+local outlivingConnections = {}
+
+-- Drag the whole card from anywhere on it, clamped so it can never be dragged
+-- out of reach (the field and button are the only way forward).
+local function makeDraggable(screen, card)
+    local UserInputService = game:GetService("UserInputService")
+    local dragging, dragStart, dragOrigin = false, nil, nil
+    card.Active = true
+    card.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            dragStart = input.Position
+            dragOrigin = card.Position
+            outlivingConnections[#outlivingConnections + 1] = input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then
+                    dragging = false
+                end
+            end)
+        end
+    end)
+    outlivingConnections[#outlivingConnections + 1] = UserInputService.InputChanged:Connect(function(input)
+        if not dragging then return end
+        if input.UserInputType == Enum.UserInputType.MouseMovement
+            or input.UserInputType == Enum.UserInputType.Touch then
+            local delta = input.Position - dragStart
+            card.Position = UDim2.new(
+                dragOrigin.X.Scale, dragOrigin.X.Offset + delta.X,
+                dragOrigin.Y.Scale, dragOrigin.Y.Offset + delta.Y)
+        end
+    end)
+end
+
+local function buildStandard(session)
+    local parent = (gethui and gethui())
+        or game:GetService("CoreGui")
+
+    local screen = Instance.new("ScreenGui")
+    screen.Name = "PandaKvs_" .. tostring(math.random(100000, 999999))
+    screen.ResetOnSpawn = false
+    screen.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    screen.Parent = parent
+
+    local compact = PANDA.preset == "compact"
+    local minimal = PANDA.preset == "minimal"
+
+    -- Height follows the content: logo, description, Get Key and support link
+    -- are each optional, and a fixed height clipped the bottom row.
+    local card = Instance.new("Frame")
+    card.Size = UDim2.fromOffset(compact and 300 or 360, 0)
+    card.AutomaticSize = Enum.AutomaticSize.Y
+    card.Position = UDim2.fromScale(0.5, 0.5)
+    card.AnchorPoint = Vector2.new(0.5, 0.5)
+    card.BackgroundColor3 = Color3.fromRGB(18, 18, 22)
+    card.BorderSizePixel = 0
+    card.Parent = screen
+
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 12)
+    corner.Parent = card
+
+    local stroke = Instance.new("UIStroke")
+    stroke.Color = PANDA.accent
+    stroke.Transparency = 0.7
+    stroke.Parent = card
+
+    local layout = Instance.new("UIListLayout")
+    layout.Padding = UDim.new(0, 8)
+    layout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+    layout.SortOrder = Enum.SortOrder.LayoutOrder
+    layout.Parent = card
+
+    local padding = Instance.new("UIPadding")
+    padding.PaddingTop = UDim.new(0, 18)
+    padding.PaddingBottom = UDim.new(0, 18)
+    padding.PaddingLeft = UDim.new(0, 18)
+    padding.PaddingRight = UDim.new(0, 18)
+    padding.Parent = card
+
+    local order = 0
+    local function nextOrder()
+        order = order + 1
+        return order
+    end
+
+    if PANDA.logoUrl and not minimal then
+        local logo = Instance.new("ImageLabel")
+        logo.Size = UDim2.fromOffset(44, 44)
+        logo.BackgroundTransparency = 1
+        logo.Image = PANDA.logoUrl
+        logo.LayoutOrder = nextOrder()
+        logo.Parent = card
+    end
+
+    local title = Instance.new("TextLabel")
+    title.Size = UDim2.new(1, 0, 0, 24)
+    title.BackgroundTransparency = 1
+    title.Font = Enum.Font.GothamBold
+    title.TextSize = 17
+    title.TextColor3 = Color3.fromRGB(245, 245, 250)
+    title.Text = PANDA.displayName
+    title.LayoutOrder = nextOrder()
+    title.Parent = card
+
+    if PANDA.description and not minimal then
+        local subtitle = Instance.new("TextLabel")
+        subtitle.Size = UDim2.new(1, 0, 0, 30)
+        subtitle.BackgroundTransparency = 1
+        subtitle.Font = Enum.Font.Gotham
+        subtitle.TextSize = 12
+        subtitle.TextWrapped = true
+        subtitle.TextColor3 = Color3.fromRGB(150, 150, 160)
+        subtitle.Text = PANDA.description
+        subtitle.LayoutOrder = nextOrder()
+        subtitle.Parent = card
+    end
+
+    local field = Instance.new("TextBox")
+    field.Size = UDim2.new(1, 0, 0, 36)
+    field.BackgroundColor3 = Color3.fromRGB(30, 30, 36)
+    field.BorderSizePixel = 0
+    field.Font = Enum.Font.Code
+    field.TextSize = 13
+    field.TextColor3 = Color3.fromRGB(235, 235, 240)
+    field.PlaceholderText = "Enter your key"
+    field.Text = ""
+    field.ClearTextOnFocus = false
+    field.LayoutOrder = nextOrder()
+    field.Parent = card
+
+    local fieldCorner = Instance.new("UICorner")
+    fieldCorner.CornerRadius = UDim.new(0, 8)
+    fieldCorner.Parent = field
+
+    local submit = Instance.new("TextButton")
+    submit.Size = UDim2.new(1, 0, 0, 34)
+    submit.BackgroundColor3 = PANDA.accent
+    submit.BorderSizePixel = 0
+    submit.Font = Enum.Font.GothamBold
+    submit.TextSize = 13
+    submit.TextColor3 = Color3.fromRGB(12, 12, 15)
+    submit.Text = "Continue"
+    submit.LayoutOrder = nextOrder()
+    submit.Parent = card
+
+    local submitCorner = Instance.new("UICorner")
+    submitCorner.CornerRadius = UDim.new(0, 8)
+    submitCorner.Parent = submit
+
+    local getKey
+    if PANDA.getKeyUrl or PANDA.supportUrl then
+        getKey = Instance.new("TextButton")
+        getKey.Size = UDim2.new(1, 0, 0, 34)
+        getKey.BackgroundColor3 = Color3.fromRGB(30, 30, 36)
+        getKey.BorderSizePixel = 0
+        getKey.Font = Enum.Font.GothamBold
+        getKey.TextSize = 13
+        getKey.TextColor3 = Color3.fromRGB(235, 235, 240)
+        getKey.Text = "Get Key"
+        getKey.LayoutOrder = nextOrder()
+        getKey.Parent = card
+
+        local getKeyCorner = Instance.new("UICorner")
+        getKeyCorner.CornerRadius = UDim.new(0, 8)
+        getKeyCorner.Parent = getKey
+
+        local getKeyStroke = Instance.new("UIStroke")
+        getKeyStroke.Color = PANDA.accent
+        getKeyStroke.Transparency = 0.6
+        getKeyStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+        getKeyStroke.Parent = getKey
+    end
+
+    local status = Instance.new("TextLabel")
+    status.Size = UDim2.new(1, 0, 0, 30)
+    status.BackgroundTransparency = 1
+    status.Font = Enum.Font.Gotham
+    status.TextSize = 11
+    status.TextWrapped = true
+    status.TextColor3 = Color3.fromRGB(150, 150, 160)
+    status.Text = ""
+    status.LayoutOrder = nextOrder()
+    status.Parent = card
+
+    if getKey then
+        getKey.MouseButton1Click:Connect(function()
+            copyKeyLink(function(text, colour)
+                status.Text = text
+                status.TextColor3 = colour
+            end, Color3.fromRGB(140, 220, 160), Color3.fromRGB(235, 120, 120))
+        end)
+    end
+
+    -- Only alongside a real key page; with no service, Get Key already copies it.
+    if PANDA.supportUrl and PANDA.getKeyUrl then
+        local support = Instance.new("TextButton")
+        support.Size = UDim2.new(1, 0, 0, 16)
+        support.BackgroundTransparency = 1
+        support.Font = Enum.Font.Gotham
+        support.TextSize = 11
+        support.TextColor3 = Color3.fromRGB(120, 120, 132)
+        support.Text = "Need help? Click to copy the support link"
+        support.LayoutOrder = nextOrder()
+        support.Parent = card
+
+        support.MouseButton1Click:Connect(function()
+            local ok = pcall(function() setclipboard(PANDA.supportUrl) end)
+            support.Text = ok and "Support link copied" or PANDA.supportUrl
+        end)
+    end
+
+    return {
+        screen = screen,
+        card = card,
+        field = field,
+        submit = submit,
+        status = status,
+        stroke = stroke,
+    }
+end
+
+-- A short rotating line, shared by the ported layouts. Cosmetic only.
+local QUOTES = {
+    "Read the code you paste.",
+    "The server always wins.",
+    "Nothing client-side is safe.",
+    "Keys are cheap, trust is not.",
+    "Patience beats brute force.",
+    "One key, one machine, one story.",
+}
+local function pickQuote()
+    return QUOTES[Random.new():NextInteger(1, #QUOTES)]
+end
+
+-- Glacier: the dashboard's own light look as a Roblox window. An ice-white
+-- two-column panel, square corners, hairline rime borders, mono uppercase
+-- captions. Identity and facts on the left, everything the player acts on down
+-- the right. Ported from the ArcticAuth "Glacier" GUI onto Panda's key flow:
+-- the HWID comes from hardwareId(), the key link from keyLink(), and the
+-- check is the shared flow's own validation, not an injected SDK.
+local function buildGlacier(session)
+    local parent = (gethui and gethui()) or game:GetService("CoreGui")
+
+    local accent = PANDA.accent
+    local paper = Color3.fromRGB(247, 250, 251)
+    local ice = Color3.fromRGB(237, 242, 245)
+    local rime = Color3.fromRGB(201, 214, 223)
+    local ink = Color3.fromRGB(7, 22, 32)
+    local mute = Color3.fromRGB(78, 102, 117)
+    local dim = Color3.fromRGB(122, 143, 155)
+    local bad = Color3.fromRGB(176, 35, 72)
+
+    local hwid = hardwareId()
+    local hwidShown = hwid == "" and "UNAVAILABLE"
+        or (#hwid > 22 and (hwid:sub(1, 22) .. "...") or hwid)
+    local today = string.upper(os.date("%d %b %Y"))
+
+    local screen = Instance.new("ScreenGui")
+    screen.Name = "PandaKvs_" .. tostring(math.random(100000, 999999))
+    screen.IgnoreGuiInset = true
+    screen.ResetOnSpawn = false
+    screen.DisplayOrder = 1000
+    screen.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    screen.Parent = parent
+
+    local shade = Instance.new("Frame")
+    shade.Size = UDim2.fromScale(1, 1)
+    shade.BackgroundColor3 = Color3.fromRGB(4, 16, 26)
+    shade.BackgroundTransparency = 0.45
+    shade.BorderSizePixel = 0
+    shade.Parent = screen
+
+    local card = Instance.new("Frame")
+    card.AnchorPoint = Vector2.new(0.5, 0.5)
+    card.Position = UDim2.fromScale(0.5, 0.5)
+    card.Size = UDim2.fromOffset(640, 300)
+    card.BackgroundColor3 = paper
+    card.BorderSizePixel = 0
+    card.Parent = screen
+    local cardStroke = Instance.new("UIStroke", card)
+    cardStroke.Color = rime
+    cardStroke.Thickness = 1
+    makeDraggable(screen, card)
+
+    local function label(parentFrame, text, size, colour, font, order)
+        local l = Instance.new("TextLabel")
+        l.BackgroundTransparency = 1
+        l.Size = UDim2.new(1, 0, 0, size + 4)
+        l.AutomaticSize = Enum.AutomaticSize.Y
+        l.Font = font
+        l.TextSize = size
+        l.TextColor3 = colour
+        l.TextXAlignment = Enum.TextXAlignment.Left
+        l.TextYAlignment = Enum.TextYAlignment.Top
+        l.TextWrapped = true
+        l.Text = text
+        l.LayoutOrder = order
+        l.Parent = parentFrame
+        return l
+    end
+
+    -- right column, built first so the status line exists for the HWID row
+    local right = Instance.new("Frame")
+    right.BackgroundTransparency = 1
+    right.Position = UDim2.new(0, 253, 0, 0)
+    right.Size = UDim2.new(1, -253, 1, 0)
+    right.Parent = card
+    local rightPad = Instance.new("UIPadding", right)
+    rightPad.PaddingTop = UDim.new(0, 22)
+    rightPad.PaddingLeft = UDim.new(0, 22)
+    rightPad.PaddingRight = UDim.new(0, 26)
+    local rightList = Instance.new("UIListLayout", right)
+    rightList.Padding = UDim.new(0, 10)
+    rightList.SortOrder = Enum.SortOrder.LayoutOrder
+
+    local status = Instance.new("TextLabel")
+    status.BackgroundTransparency = 1
+    status.Size = UDim2.new(1, 0, 0, 15)
+    status.AutomaticSize = Enum.AutomaticSize.Y
+    status.Font = Enum.Font.Gotham
+  
